@@ -51,7 +51,7 @@ async function handleDownload(images) {
       done++;
     } catch (err) {
       failed++;
-      failures.push({ filename: item.filename, url: item.url, error: err.message });
+      failures.push({ filename: item.filename, url: item.url, error: err.message || String(err) });
     }
     broadcast({ type: 'DOWNLOAD_PROGRESS', done: done, failed: failed, total: total, current: item.filename });
   }
@@ -59,10 +59,24 @@ async function handleDownload(images) {
   broadcast({ type: 'DOWNLOAD_DONE', done: done, failed: failed, total: total, failures: failures });
 }
 
+// 下载单张：优先统一转 PNG；转 PNG 失败（如 SVG / 损坏图片）时回退为直接下载原图
 async function downloadOne(item) {
-  const pngBlob = await fetchAndConvertToPng(item.url);
-  const objectUrl = URL.createObjectURL(pngBlob);
-  await downloadBlob(objectUrl, item.filename);
+  let downloadUrl;
+  let filename = item.filename;
+
+  try {
+    const pngBlob = await fetchAndConvertToPng(item.url);
+    // 关键修复：把 Blob 转成 data URL 再下载。
+    // 之前用 URL.createObjectURL 生成 blob: 地址，在 Service Worker 中会因
+    // worker 被回收而失效，导致下载失败；data URL 内容自包含，不依赖 worker 存活。
+    downloadUrl = await blobToDataUrl(pngBlob);
+  } catch (err) {
+    // 转换失败则直接下载原图，并按真实扩展名修正文件名
+    filename = item.filename.replace(/\.png$/i, '') + getExtensionFromUrl(item.url);
+    downloadUrl = item.url;
+  }
+
+  await startDownload(downloadUrl, filename);
 }
 
 // 跨域拉取图片并统一转成 PNG（凭 host_permissions 可直接 fetch，无需目标站 CORS 头）
@@ -83,31 +97,63 @@ async function fetchAndConvertToPng(url) {
   return await canvas.convertToBlob({ type: 'image/png' });
 }
 
-// 用 blob URL 触发下载，并在真正完成后释放 URL
-function downloadBlob(objectUrl, filename) {
+// Blob → data URL（base64）
+async function blobToDataUrl(blob) {
+  const buffer = await blob.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  return 'data:' + (blob.type || 'image/png') + ';base64,' + bytesToBase64(bytes);
+}
+
+// Uint8Array → base64 字符串
+function bytesToBase64(bytes) {
+  if (typeof btoa === 'function') {
+    let binary = '';
+    const chunk = 0x8000; // 分段拼接，避免大数组 apply 时栈溢出
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+  // 兜底：手动实现 base64（防止个别环境没有 btoa）
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const b2 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    out += chars[b0 >> 2];
+    out += chars[((b0 & 3) << 4) | (b1 >> 4)];
+    out += i + 1 < bytes.length ? chars[((b1 & 15) << 2) | (b2 >> 6)] : '=';
+    out += i + 2 < bytes.length ? chars[b2 & 63] : '=';
+  }
+  return out;
+}
+
+// 从 URL 推断文件扩展名（回退直接下载原图时使用）
+function getExtensionFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const m = u.pathname.match(/\.([a-zA-Z0-9]{1,5})(?:$|[?#])/);
+    if (m) {
+      const ext = m[1].toLowerCase();
+      if (ext) return '.' + ext;
+    }
+  } catch (e) { /* 解析失败则用默认值 */ }
+  return '.png';
+}
+
+// 触发下载（data URL 或 http(s) URL 均可）
+function startDownload(url, filename) {
   return new Promise(function (resolve, reject) {
     chrome.downloads.download(
-      { url: objectUrl, filename: filename, saveAs: false, conflictAction: 'uniquify' },
+      { url: url, filename: filename, saveAs: false, conflictAction: 'uniquify' },
       function (downloadId) {
         const err = chrome.runtime.lastError;
         if (err || downloadId == null) {
-          URL.revokeObjectURL(objectUrl);
           reject(new Error(err ? err.message : '无法创建下载任务'));
           return;
         }
-        const listener = function (delta) {
-          if (delta.id !== downloadId || !delta.state) return;
-          if (delta.state.current === 'complete') {
-            chrome.downloads.onChanged.removeListener(listener);
-            URL.revokeObjectURL(objectUrl);
-            resolve();
-          } else if (delta.state.current === 'interrupted') {
-            chrome.downloads.onChanged.removeListener(listener);
-            URL.revokeObjectURL(objectUrl);
-            reject(new Error(delta.error ? delta.error.current : '下载被中断'));
-          }
-        };
-        chrome.downloads.onChanged.addListener(listener);
+        resolve(downloadId);
       }
     );
   });

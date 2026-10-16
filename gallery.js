@@ -203,6 +203,14 @@ function onDownloadDone(msg) {
 
   if (msg.failed > 0 && msg.failures && msg.failures.length) {
     console.warn('下载失败列表：', msg.failures);
+    // 弹出失败详情，方便定位原因
+    const details = msg.failures.slice(0, 5).map(function (f) {
+      return f.filename + '：' + f.error;
+    }).join('\n');
+    const more = msg.failures.length > 5 ? '\n…等共 ' + msg.failures.length + ' 个' : '';
+    setTimeout(function () {
+      alert('部分图片下载失败：\n' + details + more);
+    }, 300);
   }
 
   // 4 秒后自动隐藏进度条
