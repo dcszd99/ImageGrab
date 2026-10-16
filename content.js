@@ -63,11 +63,20 @@
         return;
       }
       // 把图片列表交给后台（service worker），由后台存储并打开图库页
-      chrome.runtime.sendMessage({ type: 'IMAGES_EXTRACTED', images: images });
+      chrome.runtime.sendMessage({ type: 'IMAGES_EXTRACTED', images: images }).catch(function () {
+        // 异步发送失败时忽略，避免未处理的 Promise 拒绝
+      });
       setButtonState('done', '已提取 ' + images.length + ' 张', 2000);
     } catch (err) {
-      setButtonState('done', '提取失败', 2000);
       console.error('[电商图片提取] 提取失败：', err);
+      const msg = (err && err.message) ? err.message : String(err);
+      if (/context invalidated|message port closed/i.test(msg)) {
+        // 扩展刚被重新加载，当前页面里的旧脚本已失效，刷新页面即可
+        alert('扩展已更新，请刷新当前商品页面后重试。');
+      } else {
+        alert('图片提取失败：' + msg);
+      }
+      setButtonState('done', '提取失败', 3000);
     }
   }
 
@@ -89,24 +98,30 @@
     const found = new Map();
 
     // 1) 所有 <img> 标签，覆盖各种懒加载属性
-    document.querySelectorAll('img').forEach(function (img) {
-      const urls = collectImgUrls(img);
-      const w = img.naturalWidth || 0;
-      const h = img.naturalHeight || 0;
-      urls.forEach(function (u) { addCandidate(found, u, w, h); });
-    });
+    try {
+      document.querySelectorAll('img').forEach(function (img) {
+        const urls = collectImgUrls(img);
+        const w = img.naturalWidth || 0;
+        const h = img.naturalHeight || 0;
+        urls.forEach(function (u) { addCandidate(found, u, w, h); });
+      });
+    } catch (e) { console.warn('[提取] <img> 扫描异常：', e); }
 
     // 2) 内联 style 里写了 background 的元素（background / background-image）
-    document.querySelectorAll('[style*="background"]').forEach(function (el) {
-      const urls = extractBackgroundUrls(el, false);
-      urls.forEach(function (u) { addCandidate(found, u, 0, 0); });
-    });
+    try {
+      document.querySelectorAll('[style*="background"]').forEach(function (el) {
+        const urls = extractBackgroundUrls(el, false);
+        urls.forEach(function (u) { addCandidate(found, u, 0, 0); });
+      });
+    } catch (e) { console.warn('[提取] 内联背景扫描异常：', e); }
 
     // 3) 常见商品图容器（轮播 swiper / slide / pic 等）的计算样式 background
-    document.querySelectorAll('[class*="swiper"], [class*="slide"], [class*="pic"], [class*="img"], [class*="lazyload"]').forEach(function (el) {
-      const urls = extractBackgroundUrls(el, true);
-      urls.forEach(function (u) { addCandidate(found, u, 0, 0); });
-    });
+    try {
+      document.querySelectorAll('[class*="swiper"], [class*="slide"], [class*="pic"], [class*="img"], [class*="lazyload"]').forEach(function (el) {
+        const urls = extractBackgroundUrls(el, true);
+        urls.forEach(function (u) { addCandidate(found, u, 0, 0); });
+      });
+    } catch (e) { console.warn('[提取] 计算背景扫描异常：', e); }
 
     const images = [];
     found.forEach(function (info, url) {
